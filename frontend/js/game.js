@@ -297,6 +297,11 @@ function render() {
 
   document.title = `${game.name} · RetroX`;
 
+  // The M3U sidecar is a boot playlist, not a disc — exclude it from the
+  // disc count and the disc picker so 2-disk games don't advertise
+  // "3 discs" nor offer the playlist as a selectable disc.
+  const discs = (game.disk_names || []).filter(n => !/\.m3u$/i.test(n));
+
   slot.innerHTML = `
     <article class="detail">
       <div class="detail__art" style="background-image: url('${cover}')"></div>
@@ -308,7 +313,7 @@ function render() {
         <div class="detail__info">
           <div class="detail__system">
             <span class="pill pill--accent">${escapeHtml(systemLabel(game.system))}</span>
-            ${game.disks > 1 ? `<span class="pill">${game.disks} discs</span>` : ""}
+            ${discs.length > 1 ? `<span class="pill">${discs.length} discs</span>` : ""}
             ${game.release_date ? `<span class="pill">Released ${escapeHtml(game.release_date)}</span>` : ""}
             ${isFav ? `<span class="pill"><span style="color:var(--accent);display:inline-flex;margin-right:4px">${icon("heartFilled", { size: 12 })}</span>Favorited</span>` : ""}
           </div>
@@ -332,11 +337,13 @@ function render() {
               ${icon(isFav ? "heartFilled" : "heart", { size: 16 })}
               <span>${isFav ? "Favorited" : "Favorite"}</span>
             </button>
-            ${game.disks > 1 ? `
+            ${discs.length > 1 ? `
               <span class="detail__disk-picker">
                 <label for="disk-select">Disc</label>
                 <select id="disk-select" class="select">
-                  ${game.disk_names.map((n, i) => `<option value="${i + 1}" ${i + 1 === selectedDisk ? "selected" : ""}>${i + 1}. ${escapeHtml(n)}</option>`).join("")}
+                  ${game.disk_names.map((n, i) => !/\.m3u$/i.test(n)
+                    ? `<option value="${i + 1}" ${i + 1 === selectedDisk ? "selected" : ""}>${discs.indexOf(n) + 1}. ${escapeHtml(n)}</option>`
+                    : "").join("")}
                 </select>
               </span>
             ` : ""}

@@ -421,12 +421,58 @@ if (decision.source === "server" && decision.bytes) {
 const mount = document.getElementById("emulator-mount");
 mount.innerHTML = `<div id="game" style="width:100%;height:100%"></div>`;
 
-const diskIndex = Math.min(Math.max(requestedDisk, 1), game.disks);
-const diskName = game.disk_names[diskIndex - 1] || "rom";
-const emuName = diskName.replace(/\.gz$/i, "");
-const romUrl = api.url(
-  `/games/${encodeURIComponent(game.id)}/rom/${encodeURIComponent(emuName)}?disk=${diskIndex}`,
-);
+// // This is the old implementation - keeping commented out for reference
+// const diskIndex = Math.min(Math.max(requestedDisk, 1), game.disks);
+// const diskName = game.disk_names[diskIndex - 1] || "rom";
+// const emuName = diskName.replace(/\.gz$/i, "");
+// const romUrl = api.url(
+//   `/games/${encodeURIComponent(game.id)}/rom/${encodeURIComponent(emuName)}?disk=${diskIndex}`,
+// );
+
+const diskEntries = (game.disk_names || []).map((name, index) => ({
+  name: name.replace(/\.gz$/i, ""),
+  index: index + 1,
+}));
+
+// For multi-disk games, boot the M3U and inject all of the referenced
+// disk images into EmulatorJS's virtual filesystem.
+const m3u = diskEntries.find((d) => /\.m3u$/i.test(d.name));
+
+let diskIndex;
+let diskName;
+let emuName;
+let romUrl;
+
+if (m3u) {
+  diskIndex = m3u.index;
+  diskName = m3u.name;
+  emuName = diskName;
+
+  romUrl = api.url(
+    `/games/${encodeURIComponent(game.id)}/rom/${encodeURIComponent(emuName)}?disk=${diskIndex}`,
+  );
+
+  const externalFiles = {};
+
+  for (const disk of diskEntries) {
+    if (disk.index === m3u.index) continue;
+
+    externalFiles[`/${disk.name}`] = api.url(
+      `/games/${encodeURIComponent(game.id)}/rom/${encodeURIComponent(disk.name)}?disk=${disk.index}`,
+    );
+  }
+
+  window.EJS_externalFiles = externalFiles;
+} else {
+  // Existing single-disk behaviour.
+  diskIndex = Math.min(Math.max(requestedDisk, 1), game.disks);
+  diskName = game.disk_names[diskIndex - 1] || "rom";
+  emuName = diskName.replace(/\.gz$/i, "");
+
+  romUrl = api.url(
+    `/games/${encodeURIComponent(game.id)}/rom/${encodeURIComponent(emuName)}?disk=${diskIndex}`,
+  );
+}
 
 if (!game.core) {
   toast.error("Unsupported system", `No core configured for "${game.system}"`);
@@ -598,6 +644,67 @@ if (decision.shouldUpload && decision.bytes) {
 
 /* ============ Race-proof attach via setter trap on window.EJS_emulator ============ */
 
+// EmulatorJS v4.2.3 ships three bugs that only bite multi-disk (M3U)
+// games. All three are patched from the frontend so the vendored bundle
+// under docker/emulatorjs — an upstream dependency — stays untouched.
+//
+//  1) startGame() calls setupDisksMenu() BEFORE setupSettingsMenu(). The
+//     disk menu's construction emits menuOptionChanged("disk", ...) on the
+//     current disk, whose `this.allSettings["disk"] = value` blows up
+//     because allSettings isn't initialized until setupSettingsMenu() runs:
+//     "Cannot set properties of undefined (setting 'disk')" → the game
+//     never boots. Seeding allSettings here (the trap fires during
+//     `new EmulatorJS(...)`, long before the async startGame()) removes
+//     the undefined write. setupSettingsMenu() later resets it to {} and
+//     proceeds as usual.
+//
+//  2) GameManager.loadExternalFiles() writes each `EJS_externalFiles`
+//     entry straight from the XHR's raw ArrayBuffer, and emscripten's
+//     FS.writeFile stores ZERO bytes for a raw ArrayBuffer (it consumes
+//     typed arrays or strings). The M3U therefore parses the right disk
+//     count while every referenced disk image is an empty file. Patching
+//     writeFile once on the class prototype — before downloadFiles()
+//     constructs the manager — coerces the payload to a Uint8Array. Safe
+//     for every other caller (strings/typed arrays pass through).
+//
+//  3) setupDisksMenu() re-emits the current disk through
+//     menuOptionChanged("disk", "0") while building the list. Once (1)
+//     is patched, that emission reaches handleSpecialOptions → the
+//     core's set_current_disk, which ABORTS the live puae WASM core
+//     ("RuntimeError: unreachable" — proven by truncating the M3U to a
+//     single entry, which boots, vs. the 2-entry playlist, which does
+//     not). The emission is a no-op by definition — the core is already
+//     on the disk being selected — so we short-circuit disk calls until
+//     the emulator has started; user-initiated disk swaps after
+//     startGame() still flow through the original method.
+function patchEmulatorJs(emu) {
+  if (!emu) return;
+  if (!emu.allSettings) emu.allSettings = {};
+
+  const GM = window.EJS_GameManager;
+  if (GM && !GM.prototype.__retroxWriteFilePatched) {
+    const original = GM.prototype.writeFile;
+    GM.prototype.writeFile = function (path, data) {
+      if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+      return original.call(this, path, data);
+    };
+    GM.prototype.__retroxWriteFilePatched = true;
+  }
+
+  if (typeof emu.menuOptionChanged === "function" && !emu.__retroxMenuOptionPatched) {
+    emu.__retroxMenuOptionPatched = true;
+    const original = emu.menuOptionChanged;
+    emu.menuOptionChanged = function (option, value) {
+      if (option === "disk" && !this.started) {
+        if (!this.allSettings) this.allSettings = {};
+        this.allSettings[option] = value;
+        return;
+      }
+      return original.apply(this, arguments);
+    };
+  }
+}
+
 (function installSetterTrap() {
   let _emu = null;
   Object.defineProperty(window, "EJS_emulator", {
@@ -606,6 +713,11 @@ if (decision.shouldUpload && decision.bytes) {
     get() { return _emu; },
     set(v) {
       _emu = v;
+      // The trap fires synchronously during `new EmulatorJS(...)`, before
+      // the async downloadFiles()->loadExternalFiles()->startGame() chain
+      // runs — the only safe place to seed allSettings and patch the
+      // GameManager prototype so all three M3U bugs are dead on arrival.
+      patchEmulatorJs(v);
       // Apply our keyboard overrides BEFORE EJS's bindListeners runs
       // (which clones defaultControllers into controls). EJS may set
       // this multiple times during init — both calls below are idempotent.
@@ -1169,6 +1281,37 @@ setTimeout(() => {
 
 async function onGameStart() {
   startPlaytimeTracker(game.id);
+  // M3U games boot the playlist, which starts on its first entry. Honor
+  // a `disk=N` requested from the disk picker by flipping the core to
+  // the matching entry once the manager is live. clamp to the actual
+  // disk count — the M3U itself may appear in disk_names, so game.disks
+  // can exceed what the core reports.
+  //
+  // puae can take a few seconds after "start" before it accepts disk
+  // swaps via the libretro interface — calling setCurrentDisk too early
+  // silently drops the call.  A short poll retries the switch until
+  // the core reflects it or a timeout is reached.
+  if (m3u) {
+    try {
+      const gm = window.EJS_emulator?.gameManager;
+      const count = gm?.getDiskCount ? gm.getDiskCount() : 0;
+      const target = Math.min(Math.max(requestedDisk - 1, 0), Math.max(count - 1, 0));
+      if (gm && count > 1 && typeof gm.setCurrentDisk === "function") {
+        const apply = () => {
+          try { gm.setCurrentDisk(target); } catch { /* core not ready yet */ }
+        };
+        apply();
+        const ok = () => { try { return gm.getCurrentDisk() === target; } catch { return false; } };
+        if (!ok()) {
+          let attempts = 0;
+          const poll = setInterval(() => {
+            if (ok() || attempts++ >= 25) { clearInterval(poll); return; }
+            apply();
+          }, 200);
+        }
+      }
+    } catch { /* core may not expose disk control — fall through */ }
+  }
   // Re-assert our defaultControls AFTER EJS's loadSettings() has run.
   // loadSettings restores controls from per-device localStorage (left over
   // from EJS's now-hidden in-game Controls menu, or from a prior version
